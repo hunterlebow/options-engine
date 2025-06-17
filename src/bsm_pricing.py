@@ -9,10 +9,10 @@ from py_vollib.black_scholes.implied_volatility import implied_volatility
 from py_vollib.black_scholes_merton import black_scholes_merton as bsm
 
 try:
-    from .polygon_api import get_risk_free_rate, get_underlying_price
+    from .polygon_api import get_risk_free_rate, get_underlying_price, get_dividend_yield
 except ImportError:
     # Handle case when module is imported directly
-    from polygon_api import get_risk_free_rate, get_underlying_price
+    from polygon_api import get_risk_free_rate, get_underlying_price, get_dividend_yield
 
 def calculate_time_to_expiry(expiry_date: Union[date, pd.Timestamp]) -> float:
     """Calculate time to expiry in years."""
@@ -27,7 +27,8 @@ def calculate_bsm_price_scalar(
     r: float,
     sigma: float,
     option_type: str,
-    q: float = 0.0  # Dividend yield, default to 0
+    q: Optional[float] = None,  # Now optional - will fetch dynamically if None
+    symbol: Optional[str] = None  # Symbol for dynamic dividend yield lookup
 ) -> float:
     """
     Calculate BSM price for a single option.
@@ -47,13 +48,27 @@ def calculate_bsm_price_scalar(
     option_type : str
         'call' or 'put'
     q : float, optional
-        Dividend yield (default 0.0)
+        Dividend yield (if None, will fetch dynamically using symbol)
+    symbol : str, optional
+        Symbol for dynamic dividend yield lookup (required if q is None)
         
     Returns
     -------
     float
         BSM option price
     """
+    # Handle dividend yield
+    if q is None:
+        if symbol is None:
+            print("Warning: No dividend yield or symbol provided. Using 0% dividend yield.")
+            q = 0.0
+        else:
+            try:
+                q = get_dividend_yield(symbol)
+            except Exception as e:
+                print(f"Warning: Could not fetch dividend yield for {symbol}: {e}. Using 0%.")
+                q = 0.0
+    
     try:
         return bsm(
             option_type.lower()[0],  # 'c' or 'p'
@@ -74,6 +89,8 @@ def calculate_bsm_price_dataframe(
     df: pd.DataFrame,
     underlying_price: Optional[float] = None,
     risk_free_rate: Optional[float] = None,
+    dividend_yield: Optional[float] = None,
+    symbol: Optional[str] = None
 ) -> pd.DataFrame:
     """
     Calculate BSM prices for a DataFrame of options.
@@ -90,6 +107,10 @@ def calculate_bsm_price_dataframe(
         Current price of the underlying. If None, fetched from API.
     risk_free_rate : float, optional
         Risk-free rate. If None, fetched from FRED.
+    dividend_yield : float, optional
+        Dividend yield. If None, fetched dynamically using symbol.
+    symbol : str, optional
+        Symbol for dynamic data fetching (required if other params are None)
         
     Returns
     -------
@@ -101,11 +122,19 @@ def calculate_bsm_price_dataframe(
     """
     # Get market data if not provided
     if underlying_price is None:
-        # We'll need to pass the symbol separately or get it from the data
-        # For now, we'll require it to be passed in
-        raise ValueError("underlying_price must be provided")
+        if symbol is None:
+            raise ValueError("Either underlying_price or symbol must be provided")
+        underlying_price = get_underlying_price(symbol)
+        
     if risk_free_rate is None:
         risk_free_rate = get_risk_free_rate()
+        
+    if dividend_yield is None:
+        if symbol is None:
+            print("Warning: No dividend yield or symbol provided. Using 0% dividend yield.")
+            dividend_yield = 0.0
+        else:
+            dividend_yield = get_dividend_yield(symbol)
     
     # Calculate time to expiry
     df["time_to_expiry"] = df["expiration_date"].apply(calculate_time_to_expiry)
@@ -136,7 +165,7 @@ def calculate_bsm_price_dataframe(
                 row["time_to_expiry"],
                 risk_free_rate,
                 row["implied_volatility"],
-                0.0  # dividend yield
+                dividend_yield  # Now uses dynamic dividend yield
             )
         except:
             return np.nan

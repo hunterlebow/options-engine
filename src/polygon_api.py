@@ -24,6 +24,76 @@ def get_risk_free_rate() -> float:
             return config.CONSTANT_RF_RATE
     return config.CONSTANT_RF_RATE
 
+def get_dividend_yield(symbol: str) -> float:
+    """
+    Get the current dividend yield for a symbol from Polygon.io.
+    
+    Parameters
+    ----------
+    symbol : str
+        The ticker symbol (e.g., 'SPY', 'QQQ', 'AAPL')
+        
+    Returns
+    -------
+    float
+        Annual dividend yield as a decimal (e.g., 0.013 for 1.3%)
+    """
+    client = RESTClient(config.POLYGON_API_KEY)
+    
+    try:
+        # Get the last 12 months of dividend data
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=365)
+        
+        # Fetch dividend data from Polygon
+        dividends_response = client.list_dividends(
+            ticker=symbol,
+            ex_dividend_date_gte=start_date.strftime("%Y-%m-%d"),
+            ex_dividend_date_lte=end_date.strftime("%Y-%m-%d"),
+            limit=50  # Should be enough for a year of dividends
+        )
+        
+        # Convert to list to process
+        dividends = list(dividends_response)
+        
+        if not dividends:
+            print(f"Warning: No dividend data found for {symbol} in the last 12 months. Using 0% yield.")
+            return 0.0
+        
+        # Calculate total dividends paid in the last 12 months
+        total_dividends = sum(div.cash_amount for div in dividends if hasattr(div, 'cash_amount'))
+        
+        if total_dividends <= 0:
+            print(f"Warning: No valid dividend amounts found for {symbol}. Using 0% yield.")
+            return 0.0
+        
+        # Get current stock price to calculate yield
+        current_price = get_underlying_price(symbol)
+        
+        if current_price <= 0:
+            print(f"Warning: Could not get valid price for {symbol}. Using 0% yield.")
+            return 0.0
+        
+        # Calculate annual dividend yield
+        dividend_yield = total_dividends / current_price
+        
+        print(f"📊 {symbol} Dividend Analysis:")
+        print(f"   • Total dividends (12 months): ${total_dividends:.4f}")
+        print(f"   • Current price: ${current_price:.2f}")
+        print(f"   • Annual dividend yield: {dividend_yield:.3%}")
+        
+        return dividend_yield
+        
+    except Exception as e:
+        print(f"Warning: Could not fetch dividend data for {symbol}: {e}")
+        print(f"Using fallback dividend yield based on symbol type...")
+        
+        # Use config fallback yields
+        fallback_yield = config.get_dividend_yield_fallback(symbol)
+        print(f"   • Using fallback yield for {symbol}: {fallback_yield:.3%}")
+        
+        return fallback_yield
+
 def get_option_chain(
     symbol: str,
     min_dte: Optional[int] = None,

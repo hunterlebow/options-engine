@@ -8,24 +8,28 @@ import pandas as pd
 
 from .bsm_pricing import calculate_bsm_price
 from .mispricing import compute_mispricing, get_top_mispriced, identify_arbitrage_opportunities
-from .polygon_api import get_option_chain
+from .polygon_api import get_option_chain, get_underlying_price, get_dividend_yield
 from .surface_utils import build_surface, plot_surface_3d
 
 def main():
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(
-        description="Production Options Engine - Real-time mispricing detection",
+        description="Production Options Engine - Real-time mispricing detection for any ticker",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Basic scan for SPY options
   python -m src.cli --symbol SPY
   
-  # Scan with custom parameters
-  python -m src.cli --symbol SPY --min-dte 7 --max-dte 21 --threshold 5.0
+  # Scan QQQ with custom parameters
+  python -m src.cli --symbol QQQ --min-dte 7 --max-dte 21 --threshold 5.0
+  
+  # Analyze individual stocks
+  python -m src.cli --symbol AAPL --min-dte 14 --max-dte 30
+  python -m src.cli --symbol TSLA --min-dte 7 --max-dte 14 --show-surface
   
   # Save results and show surface
-  python -m src.cli --symbol SPY --output spy_analysis.csv --show-surface
+  python -m src.cli --symbol META --output meta_analysis.csv --show-surface
         """
     )
     
@@ -34,7 +38,7 @@ Examples:
         "--symbol",
         type=str,
         required=True,
-        help="Underlying symbol (e.g., SPY, QQQ, AAPL)",
+        help="Underlying symbol (e.g., SPY, QQQ, AAPL, TSLA, META, HOOD, etc.)",
     )
     
     # Optional arguments
@@ -84,6 +88,11 @@ Examples:
         default=3.0,
         help="Maximum bid-ask spread filter (default: $3.00)",
     )
+    parser.add_argument(
+        "--dividend-yield",
+        type=float,
+        help="Override dividend yield (as percentage, e.g., 1.3 for 1.3%). If not provided, fetched dynamically.",
+    )
     
     args = parser.parse_args()
     
@@ -92,13 +101,26 @@ Examples:
         print("=" * 60)
         print("🚀 PRODUCTION OPTIONS ENGINE")
         print("=" * 60)
-        print(f"Symbol: {args.symbol}")
+        print(f"Symbol: {args.symbol.upper()}")
         print(f"DTE Range: {args.min_dte}-{args.max_dte} days")
         print(f"Mispricing Threshold: {args.threshold}%")
         print("-" * 60)
         
+        # Get underlying price and dividend info
+        print(f"📡 Fetching market data for {args.symbol.upper()}...")
+        underlying_price = get_underlying_price(args.symbol)
+        print(f"📈 Current {args.symbol.upper()} price: ${underlying_price:.2f}")
+        
+        # Get dividend yield (dynamic or override)
+        if args.dividend_yield is not None:
+            dividend_yield = args.dividend_yield / 100.0  # Convert percentage to decimal
+            print(f"💰 Using override dividend yield: {dividend_yield:.3%}")
+        else:
+            dividend_yield = get_dividend_yield(args.symbol)
+            print(f"💰 Dynamic dividend yield: {dividend_yield:.3%}")
+        
         # Get options chain
-        print("📡 Fetching options chain from Polygon.io...")
+        print(f"\n📡 Fetching options chain from Polygon.io...")
         df = get_option_chain(
             args.symbol,
             min_dte=args.min_dte,
@@ -106,39 +128,42 @@ Examples:
         )
         
         if df is None or len(df) == 0:
-            print("❌ No options data found. Check symbol and API key.")
+            print(f"❌ No options data found for {args.symbol.upper()}. Check symbol and API key.")
             sys.exit(1)
             
         print(f"✅ Retrieved {len(df):,} options contracts")
         
-        # Get current underlying price
-        underlying_price = df['underlying_price'].iloc[0] if 'underlying_price' in df.columns else None
-        if underlying_price is None:
-            print("❌ Could not determine underlying price")
-            sys.exit(1)
-            
-        print(f"📈 Current {args.symbol} price: ${underlying_price:.2f}")
-        
         # Apply liquidity filters
         print("\n🔍 Applying liquidity filters...")
+        
+        # Adjust spread filter based on underlying price (percentage-based for expensive stocks)
+        if underlying_price > 100:
+            # For expensive stocks, use percentage-based spread filter
+            max_spread_pct = 0.05  # 5% max spread
+            spread_filter = (df['ask'] - df['bid']) / df['mid_price'] <= max_spread_pct
+            print(f"   Using percentage-based spread filter: {max_spread_pct:.1%} for ${underlying_price:.0f} stock")
+        else:
+            # For cheaper stocks/ETFs, use dollar-based filter
+            spread_filter = (df['ask'] - df['bid']) <= args.max_spread
+            print(f"   Using dollar-based spread filter: ${args.max_spread:.2f}")
         
         # Filter for tradeable options
         tradeable = df[
             (df['bid'] > 0) &  # Must have bid
             (df['ask'] > df['bid']) &  # Valid spread
-            ((df['ask'] - df['bid']) <= args.max_spread) &  # Reasonable spread
+            spread_filter &  # Reasonable spread (dynamic)
             (df['open_interest'] >= 10) &  # Minimum open interest
             (df['volume'].fillna(0) >= args.min_volume) &  # Minimum volume
             (df['implied_volatility'].notna())  # Must have IV
         ].copy()
         
         if len(tradeable) == 0:
-            print("❌ No tradeable options found after filtering")
+            print(f"❌ No tradeable options found for {args.symbol.upper()} after filtering")
             sys.exit(1)
             
         print(f"✅ {len(tradeable):,} tradeable options after filtering")
         
-        # Calculate BSM prices
+        # Calculate BSM prices with dynamic dividend yield
         print("\n⚡ Calculating BSM theoretical prices...")
         
         bsm_results = []
@@ -148,9 +173,11 @@ Examples:
                     S=underlying_price,
                     K=option['strike'],
                     T=option['dte'] / 365.0,
-                    r=0.05,  # 5% risk-free rate
-                    sigma=option['implied_volatility'] / 100.0,
-                    option_type=option['option_type']
+                    r=0.05,  # 5% risk-free rate (could be made dynamic too)
+                    sigma=option['implied_volatility'],  # Already in decimal format from Polygon
+                    option_type=option['option_type'],
+                    q=dividend_yield,  # Use dynamic dividend yield
+                    symbol=args.symbol  # Pass symbol for any additional lookups
                 )
                 
                 bsm_results.append({
@@ -183,7 +210,7 @@ Examples:
         top_mispriced = get_top_mispriced(mispricing_results, n=args.top_n)
         
         # Display results
-        print(f"\n🏆 TOP {args.top_n} MISPRICING OPPORTUNITIES")
+        print(f"\n🏆 TOP {args.top_n} MISPRICING OPPORTUNITIES FOR {args.symbol.upper()}")
         print("-" * 80)
         
         if len(top_mispriced) == 0:
@@ -244,7 +271,7 @@ Examples:
             print("\n🌊 Generating 3D volatility surface...")
             surface_data = build_surface(mispricing_results)
             fig = plot_surface_3d(surface_data, underlying_price, 
-                                title=f"{args.symbol} Options Volatility Surface")
+                                title=f"{args.symbol.upper()} Options Volatility Surface")
             fig.show()
             print("✅ Volatility surface displayed")
         
