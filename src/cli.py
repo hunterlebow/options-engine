@@ -1,289 +1,285 @@
-"""Command-line interface for the options engine."""
+#!/usr/bin/env python3
+"""Command-line interface for the Options Pricing Engine."""
 
 import argparse
 import sys
-from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
+import numpy as np
+import click
+from pathlib import Path
+import logging
+from datetime import datetime
+import os
 
-from .bsm_pricing import calculate_bsm_price
-from .mispricing import compute_mispricing, get_top_mispriced, identify_arbitrage_opportunities
-from .polygon_api import get_option_chain, get_underlying_price, get_dividend_yield
-from .surface_utils import build_surface, plot_surface_3d
+from .config import config
+from .providers.polygon import get_option_chain, get_underlying_price, get_dividend_yield
+from .bsm import calculate_bsm_price_vectorized
+from .pricing_engine import PricingEngine
+from .providers.fred import get_risk_free_rate
+from .data import HistoricalDataCollector, collect_data_for_backtesting
+from .backtest import run_backtest_analysis
 
-def main():
-    """Main entry point for the CLI."""
-    parser = argparse.ArgumentParser(
-        description="Production Options Engine - Real-time mispricing detection for any ticker",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic scan for SPY options
-  python -m src.cli --symbol SPY
-  
-  # Scan QQQ with custom parameters
-  python -m src.cli --symbol QQQ --min-dte 7 --max-dte 21 --threshold 5.0
-  
-  # Analyze individual stocks
-  python -m src.cli --symbol AAPL --min-dte 14 --max-dte 30
-  python -m src.cli --symbol TSLA --min-dte 7 --max-dte 14 --show-surface
-  
-  # Save results and show surface
-  python -m src.cli --symbol META --output meta_analysis.csv --show-surface
-        """
-    )
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(name)s:%(levelname)s:%(message)s'
+)
+
+@click.group()
+def cli():
+    """Options Pricing Engine - A comprehensive toolkit for options analysis."""
+    # This function is the entry point for the Click command group.
+    # It is intentionally left blank.
+    pass
+
+@cli.command()
+@click.option('--symbol', default='QQQ', help='Stock symbol')
+@click.option('--date', default='2024-01-02', help='Date (YYYY-MM-DD)')
+@click.option('--min-dte', default=7, help='Minimum days to expiration')
+@click.option('--max-dte', default=90, help='Maximum days to expiration')
+@click.option('--models', default='sabr,quadratic,cubic', help='Comma-separated list of models')
+def validate(symbol, date, min_dte, max_dte, models):
+    """Validate pricing models against market data."""
     
-    # Required arguments
-    parser.add_argument(
-        "--symbol",
-        type=str,
-        required=True,
-        help="Underlying symbol (e.g., SPY, QQQ, AAPL, TSLA, META, HOOD, etc.)",
-    )
-    
-    # Optional arguments
-    parser.add_argument(
-        "--min-dte",
-        type=int,
-        default=7,
-        help="Minimum days to expiry (default: 7)",
-    )
-    parser.add_argument(
-        "--max-dte",
-        type=int,
-        default=21,
-        help="Maximum days to expiry (default: 21)",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=3.0,
-        help="Mispricing threshold percentage (default: 3.0)",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        help="Output file for results (CSV format)",
-    )
-    parser.add_argument(
-        "--show-surface",
-        action="store_true",
-        help="Display 3D volatility surface",
-    )
-    parser.add_argument(
-        "--top-n",
-        type=int,
-        default=10,
-        help="Number of top opportunities to show (default: 10)",
-    )
-    parser.add_argument(
-        "--min-volume",
-        type=int,
-        default=10,
-        help="Minimum daily volume filter (default: 10)",
-    )
-    parser.add_argument(
-        "--max-spread",
-        type=float,
-        default=3.0,
-        help="Maximum bid-ask spread filter (default: $3.00)",
-    )
-    parser.add_argument(
-        "--dividend-yield",
-        type=float,
-        help="Override dividend yield (as percentage, e.g., 1.3 for 1.3%). If not provided, fetched dynamically.",
-    )
-    
-    args = parser.parse_args()
+    print(f"\n🎯 Options Pricing Engine - Model Validation")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"📊 Symbol: {symbol}")
+    print(f"📅 Date: {date}")
+    print(f"⏰ DTE Range: {min_dte} to {max_dte} days")
+    print(f"🧮 Models: {models}")
+    print()
     
     try:
-        # Header
-        print("=" * 60)
-        print("🚀 PRODUCTION OPTIONS ENGINE")
-        print("=" * 60)
-        print(f"Symbol: {args.symbol.upper()}")
-        print(f"DTE Range: {args.min_dte}-{args.max_dte} days")
-        print(f"Mispricing Threshold: {args.threshold}%")
-        print("-" * 60)
+        # Parse models
+        model_list = [m.strip() for m in models.split(',')]
         
-        # Get underlying price and dividend info
-        print(f"📡 Fetching market data for {args.symbol.upper()}...")
-        underlying_price = get_underlying_price(args.symbol)
-        print(f"📈 Current {args.symbol.upper()} price: ${underlying_price:.2f}")
-        
-        # Get dividend yield (dynamic or override)
-        if args.dividend_yield is not None:
-            dividend_yield = args.dividend_yield / 100.0  # Convert percentage to decimal
-            print(f"💰 Using override dividend yield: {dividend_yield:.3%}")
-        else:
-            dividend_yield = get_dividend_yield(args.symbol)
-            print(f"💰 Dynamic dividend yield: {dividend_yield:.3%}")
-        
-        # Get options chain
-        print(f"\n📡 Fetching options chain from Polygon.io...")
-        df = get_option_chain(
-            args.symbol,
-            min_dte=args.min_dte,
-            max_dte=args.max_dte,
+        # Run validation
+        engine = PricingEngine()
+        results = engine.validate_models(
+            symbol=symbol,
+            date=date,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            models=model_list
         )
         
-        if df is None or len(df) == 0:
-            print(f"❌ No options data found for {args.symbol.upper()}. Check symbol and API key.")
-            sys.exit(1)
-            
-        print(f"✅ Retrieved {len(df):,} options contracts")
+        # Display results
+        print("📈 Model Performance Summary:")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         
-        # Apply liquidity filters
-        print("\n🔍 Applying liquidity filters...")
+        for model_name, metrics in results['model_performance'].items():
+            print(f"\n{model_name.upper()} Model:")
+            print(f"  • RMSE: ${metrics['rmse']:.2f}")
+            print(f"  • MAE:  ${metrics['mae']:.2f}")
+            print(f"  • R²:   {metrics['r2']:.3f}")
         
-        # Adjust spread filter based on underlying price (percentage-based for expensive stocks)
-        if underlying_price > 100:
-            # For expensive stocks, use percentage-based spread filter
-            max_spread_pct = 0.05  # 5% max spread
-            spread_filter = (df['ask'] - df['bid']) / df['mid_price'] <= max_spread_pct
-            print(f"   Using percentage-based spread filter: {max_spread_pct:.1%} for ${underlying_price:.0f} stock")
-        else:
-            # For cheaper stocks/ETFs, use dollar-based filter
-            spread_filter = (df['ask'] - df['bid']) <= args.max_spread
-            print(f"   Using dollar-based spread filter: ${args.max_spread:.2f}")
+        # Show best model
+        best_model = min(results['model_performance'].items(), 
+                        key=lambda x: x[1]['rmse'])
+        print(f"\n🏆 Best Model: {best_model[0].upper()} (RMSE: ${best_model[1]['rmse']:.2f})")
         
-        # Filter for tradeable options
-        tradeable = df[
-            (df['bid'] > 0) &  # Must have bid
-            (df['ask'] > df['bid']) &  # Valid spread
-            spread_filter &  # Reasonable spread (dynamic)
-            (df['open_interest'] >= 10) &  # Minimum open interest
-            (df['volume'].fillna(0) >= args.min_volume) &  # Minimum volume
-            (df['implied_volatility'].notna())  # Must have IV
-        ].copy()
+        # Show data summary
+        print(f"\n📊 Data Summary:")
+        print(f"  • Total Options: {results['total_options']:,}")
+        print(f"  • After Filtering: {results['filtered_options']:,}")
+        print(f"  • Success Rate: {results['filtered_options']/results['total_options']*100:.1f}%")
         
-        if len(tradeable) == 0:
-            print(f"❌ No tradeable options found for {args.symbol.upper()} after filtering")
-            sys.exit(1)
-            
-        print(f"✅ {len(tradeable):,} tradeable options after filtering")
+        print(f"\n✅ Validation completed successfully!")
         
-        # Calculate BSM prices with dynamic dividend yield
-        print("\n⚡ Calculating BSM theoretical prices...")
+    except Exception as e:
+        print(f"❌ Error during validation: {e}")
+        raise click.ClickException(str(e))
+
+@cli.command()
+@click.option('--symbols', default='QQQ', help='Comma-separated list of symbols')
+@click.option('--start-date', default='2024-01-01', help='Start date (YYYY-MM-DD)')
+@click.option('--end-date', default='2024-01-31', help='End date (YYYY-MM-DD)')
+@click.option('--min-dte', default=7, help='Minimum days to expiration')
+@click.option('--max-dte', default=180, help='Maximum days to expiration')
+@click.option('--max-workers', default=10, help='Maximum concurrent workers')
+@click.option('--min-strike-pct', default=0.8, help='Minimum strike as % of underlying')
+@click.option('--max-strike-pct', default=1.2, help='Maximum strike as % of underlying')
+@click.option('--force-refresh', is_flag=True, help='Force refresh existing data')
+def collect(symbols, start_date, end_date, min_dte, max_dte, max_workers, 
+           min_strike_pct, max_strike_pct, force_refresh):
+    """Collect historical options data for backtesting."""
+    
+    print(f"\n📊 Historical Data Collection")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"🎯 Symbols: {symbols}")
+    print(f"📅 Period: {start_date} to {end_date}")
+    print(f"⏰ DTE Range: {min_dte} to {max_dte} days")
+    print(f"🔧 Workers: {max_workers}")
+    print(f"💰 Strike Range: {min_strike_pct:.0%} to {max_strike_pct:.0%}")
+    print()
+    
+    try:
+        symbol_list = [s.strip().upper() for s in symbols.split(',')]
         
-        bsm_results = []
-        for idx, option in tradeable.iterrows():
-            try:
-                bsm_price = calculate_bsm_price(
-                    S=underlying_price,
-                    K=option['strike'],
-                    T=option['dte'] / 365.0,
-                    r=0.05,  # 5% risk-free rate (could be made dynamic too)
-                    sigma=option['implied_volatility'],  # Already in decimal format from Polygon
-                    option_type=option['option_type'],
-                    q=dividend_yield,  # Use dynamic dividend yield
-                    symbol=args.symbol  # Pass symbol for any additional lookups
-                )
-                
-                bsm_results.append({
-                    'bsm_price': bsm_price,
-                    'market_price': option['mid_price'],
-                    'price_diff': bsm_price - option['mid_price'],
-                    'price_diff_pct': ((bsm_price - option['mid_price']) / option['mid_price']) * 100
-                })
-                
-            except Exception as e:
-                bsm_results.append({
-                    'bsm_price': None,
-                    'market_price': option['mid_price'],
-                    'price_diff': None,
-                    'price_diff_pct': None
-                })
+        # Collect data
+        from .data import collect_data_for_backtesting
         
-        # Add BSM results
-        bsm_df = pd.DataFrame(bsm_results)
-        tradeable_with_bsm = pd.concat([tradeable.reset_index(drop=True), bsm_df], axis=1)
-        tradeable_with_bsm = tradeable_with_bsm.dropna(subset=['bsm_price'])
-        
-        print(f"✅ BSM calculations complete for {len(tradeable_with_bsm):,} options")
-        
-        # Detect mispricing
-        print("\n🎯 Detecting mispricing opportunities...")
-        mispricing_results = compute_mispricing(tradeable_with_bsm, underlying_price)
-        
-        # Get top opportunities
-        top_mispriced = get_top_mispriced(mispricing_results, n=args.top_n)
+        results = collect_data_for_backtesting(
+            symbols=symbol_list,
+            start_date=start_date,
+            end_date=end_date,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            max_workers=max_workers,
+            min_strike_pct=min_strike_pct,
+            max_strike_pct=max_strike_pct
+        )
         
         # Display results
-        print(f"\n🏆 TOP {args.top_n} MISPRICING OPPORTUNITIES FOR {args.symbol.upper()}")
-        print("-" * 80)
+        print("📈 Collection Summary:")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         
-        if len(top_mispriced) == 0:
-            print("No significant mispricing opportunities found.")
-        else:
-            print(f"{'#':<3} {'Type':<4} {'Strike':<7} {'Exp':<10} {'Market':<8} {'BSM':<8} {'Diff%':<7} {'Strategy'}")
-            print("-" * 80)
-            
-            for i, (_, row) in enumerate(top_mispriced.iterrows(), 1):
-                strategy = "SELL" if row['price_diff_pct'] < 0 else "BUY"
-                print(f"{i:<3} {row['option_type'].upper():<4} "
-                      f"${row['strike']:<6.0f} {str(row['expiration_date'])[:10]:<10} "
-                      f"${row['market_price']:<7.2f} ${row['bsm_price']:<7.2f} "
-                      f"{row['price_diff_pct']:<6.1f}% {strategy}")
+        for symbol, stats in results.items():
+            print(f"\n{symbol}:")
+            print(f"  • Files Collected: {stats['collected']}")
+            print(f"  • Files Skipped: {stats['skipped']}")
+            print(f"  • Files Failed: {stats['failed']}")
+            print(f"  • Success Rate: {stats['collected']/(stats['collected']+stats['failed'])*100:.1f}%")
         
-        # Risk analysis
-        if len(top_mispriced) > 0:
-            print(f"\n⚠️  RISK ANALYSIS")
-            print("-" * 40)
-            
-            avg_spread = (top_mispriced['ask'] - top_mispriced['bid']).mean()
-            avg_volume = top_mispriced['volume'].fillna(0).mean()
-            avg_oi = top_mispriced['open_interest'].mean()
-            avg_dte = top_mispriced['dte'].mean()
-            
-            print(f"Average bid-ask spread: ${avg_spread:.2f}")
-            print(f"Average daily volume: {avg_volume:.0f}")
-            print(f"Average open interest: {avg_oi:.0f}")
-            print(f"Average days to expiry: {avg_dte:.1f}")
-            
-            if avg_dte < 7:
-                print("⚠️  WARNING: Short-term options - high gamma risk!")
+        print(f"\n✅ Data collection completed!")
         
-        # Market summary
-        print(f"\n📊 MARKET SUMMARY")
-        print("-" * 40)
-        
-        calls = mispricing_results[mispricing_results['option_type'] == 'call']
-        puts = mispricing_results[mispricing_results['option_type'] == 'put']
-        
-        if len(calls) > 0 and len(puts) > 0:
-            avg_call_iv = calls['implied_volatility'].mean()
-            avg_put_iv = puts['implied_volatility'].mean()
-            skew = avg_put_iv - avg_call_iv
-            
-            print(f"Average Call IV: {avg_call_iv:.1f}%")
-            print(f"Average Put IV: {avg_put_iv:.1f}%")
-            print(f"Put-Call Skew: {skew:.1f}% {'(Put premium)' if skew > 0 else '(Call premium)'}")
-        
-        # Save results
-        if args.output:
-            print(f"\n💾 Saving results to {args.output}...")
-            mispricing_results.to_csv(args.output, index=False)
-            print("✅ Results saved successfully")
-        
-        # Show volatility surface
-        if args.show_surface:
-            print("\n🌊 Generating 3D volatility surface...")
-            surface_data = build_surface(mispricing_results)
-            fig = plot_surface_3d(surface_data, underlying_price, 
-                                title=f"{args.symbol.upper()} Options Volatility Surface")
-            fig.show()
-            print("✅ Volatility surface displayed")
-        
-        print(f"\n🎉 Analysis complete! Found {len(top_mispriced)} opportunities.")
-        print("=" * 60)
-        
-    except KeyboardInterrupt:
-        print("\n\n❌ Analysis interrupted by user")
-        sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        sys.exit(1)
+        print(f"❌ Error during collection: {e}")
+        raise click.ClickException(str(e))
+
+@cli.command()
+@click.option('--symbol', default='QQQ', help='Stock symbol to backtest')
+@click.option('--start-date', default='2024-01-01', help='Backtest start date (YYYY-MM-DD)')
+@click.option('--end-date', default='2024-01-31', help='Backtest end date (YYYY-MM-DD)')
+@click.option('--calibration-window', default=30, help='Calibration window in days')
+@click.option('--rebalance-frequency', default=5, help='Rebalance frequency in days')
+@click.option('--models', default='sabr,quadratic,cubic', help='Comma-separated list of models')
+@click.option('--min-dte', default=7, help='Minimum days to expiration')
+@click.option('--max-dte', default=90, help='Maximum days to expiration')
+@click.option('--max-spread-pct', default=0.5, help='Maximum bid-ask spread percentage')
+@click.option('--transaction-cost', default=0.01, help='Transaction cost per contract')
+def backtest(symbol, start_date, end_date, calibration_window, rebalance_frequency,
+            models, min_dte, max_dte, max_spread_pct, transaction_cost):
+    """Run comprehensive backtesting analysis."""
+    
+    print(f"\n🚀 Options Backtesting Engine")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"🎯 Symbol: {symbol}")
+    print(f"📅 Period: {start_date} to {end_date}")
+    print(f"📊 Calibration Window: {calibration_window} days")
+    print(f"🔄 Rebalance Frequency: {rebalance_frequency} days")
+    print(f"🧮 Models: {models}")
+    print(f"⏰ DTE Range: {min_dte} to {max_dte} days")
+    print(f"💰 Max Spread: {max_spread_pct:.1%}")
+    print(f"💸 Transaction Cost: ${transaction_cost:.2f}")
+    print()
+    
+    try:
+        # Parse models
+        model_list = [m.strip() for m in models.split(',')]
+        
+        # Run backtest
+        print("🔄 Running backtest analysis...")
+        results = run_backtest_analysis(
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            calibration_window=calibration_window,
+            rebalance_frequency=rebalance_frequency,
+            models=model_list,
+            min_dte=min_dte,
+            max_dte=max_dte,
+            max_spread_pct=max_spread_pct,
+            transaction_cost=transaction_cost
+        )
+        
+        # Display results
+        print("\n📈 Backtest Results:")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"💰 Total Return: ${results.total_return:.2f}")
+        print(f"📊 Sharpe Ratio: {results.sharpe_ratio:.2f}")
+        print(f"📉 Max Drawdown: ${results.max_drawdown:.2f}")
+        print(f"🎯 Win Rate: {results.win_rate:.1%}")
+        print(f"📝 Total Trades: {len(results.trade_analysis)}")
+        
+        # Model performance breakdown
+        print(f"\n🧮 Model Performance:")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for model, perf in results.model_performance.items():
+            print(f"{model.upper()}:")
+            print(f"  • Total PnL: ${perf['total_pnl']:.2f}")
+            print(f"  • Trades: {perf['num_trades']}")
+            print(f"  • Win Rate: {perf['win_rate']:.1%}")
+        
+        # Save detailed results
+        output_dir = Path("output")
+        output_dir.mkdir(exist_ok=True)
+        
+        # Save trade analysis
+        if not results.trade_analysis.empty:
+            trade_file = output_dir / f"{symbol}_backtest_trades_{start_date}_{end_date}.csv"
+            results.trade_analysis.to_csv(trade_file, index=False)
+            print(f"\n💾 Trade analysis saved to: {trade_file}")
+        
+        # Save calibration history
+        if not results.calibration_history.empty:
+            calib_file = output_dir / f"{symbol}_calibration_history_{start_date}_{end_date}.csv"
+            results.calibration_history.to_csv(calib_file, index=False)
+            print(f"💾 Calibration history saved to: {calib_file}")
+        
+        print(f"\n✅ Backtesting completed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error during backtesting: {e}")
+        raise click.ClickException(str(e))
+
+@cli.command()
+def status():
+    """Show data collection and system status."""
+    
+    print(f"\n📊 Options Engine Status")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    
+    try:
+        from .data import HistoricalDataCollector
+        
+        collector = HistoricalDataCollector()
+        status = collector.get_collection_status()
+        
+        print(f"📅 Last Updated: {status.get('last_updated', 'Never')}")
+        print(f"📁 Total Files: {status.get('total_files', 0)}")
+        print(f"💾 Total Size: {status.get('total_size_mb', 0):.1f} MB")
+        
+        if 'symbols' in status:
+            print(f"\n🎯 Available Symbols:")
+            print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            
+            for symbol, info in status['symbols'].items():
+                print(f"{symbol}:")
+                print(f"  • Date Range: {info.get('first_date', 'N/A')} to {info.get('last_date', 'N/A')}")
+                print(f"  • Files: {info.get('total_files', 0)}")
+                print(f"  • Size: {info.get('total_size_mb', 0):.1f} MB")
+                print(f"  • Last Collection: {info.get('last_collection', 'Never')}")
+        
+        print(f"\n✅ System operational!")
+        
+    except Exception as e:
+        print(f"❌ Error checking status: {e}")
+        raise click.ClickException(str(e))
+
+def main():
+    """
+    Main entry point for the CLI.
+    
+    This function should not be called directly. It is configured as the
+    entry point in setup.cfg and invokes the Click command-line interface.
+    """
+    # Initialize logging, etc. here if needed
+    
+    # Run the Click command-line interface
+    cli()
 
 if __name__ == "__main__":
     main() 

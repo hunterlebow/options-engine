@@ -40,4 +40,29 @@ ENV/
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Options Engine Specific
+output/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+logs/
+*.log
+temp/
+tmp/
+
+# Data files (keep structure but ignore large data)
+data/*.parquet
+data/*/*.parquet
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Backup files
+*.bak
+*.backup
+*~ 
